@@ -1,0 +1,173 @@
+#!/usr/bin/env python
+import time
+import re
+from subprocess import Popen, PIPE
+from os import stat
+from pwd import getpwuid
+import socket
+hostname = socket.gethostname()
+t = time.localtime()
+ts = time.strftime('%Y-%m-%dT%H:%M:%S%Z', t)
+
+############################ Move below into a config
+# don't change this yet, it doesn't actually work..
+showrootprocs = 'F'
+
+# skip these all together
+exclude = [ 'crond', 'sendmail', 'sshd', 'bash', 'hald', 'nscd', 'ntpd', 'hald-addon-acpi', 'dbus-daemon', 'nslcd' ]
+
+# if these are short_cmd, go ahead and transform them
+transform = {
+        'qmgr': 'postgresql',
+        'postgres': 'postgresql',
+        'pickup': 'postgresql',
+}
+# we like the way these turn out so don't transform them
+donottransform = [ 'zabbix_agentd', ]
+########################### End user config
+
+# include root processes: BROKEN as of this revision
+if showrootprocs.upper() in ('Y', 'YES', 'TRUE', 'T'):
+	pscom = 'ps -eo pid,cmd'
+else:
+	pscom = 'pgrep -v -u root -l'
+
+# generate nested python dictionaries, copied from here:
+# http://stackoverflow.com/questions/635483/what-is-the-best-way-to-implement-nested-dictionaries-in-python
+class AutoVivification(dict):
+        """Implementation of perl's autovivification feature."""
+        def __getitem__(self, item):
+                try:   
+                        return dict.__getitem__(self, item)
+                except KeyError:
+                        value = self[item] = type(self)()
+                        return value
+
+# find out who owns a file
+def find_owner(file):
+    return getpwuid(stat(file).st_uid).pw_name
+
+# make all the entries in a list unique
+def uniqify(seq):
+    	# Not order preserving
+    	#return {}.fromkeys(seq).keys()
+   	s = set(seq)
+   	return list(s)
+
+# read a file
+def readfile(fname):
+	try:
+    		f = open(fname, 'r')
+		o = f.read()
+    		return re.sub(r'\0',' ',o)
+    		f.close()
+	except:
+		msg = "ERROR: return of %s failed!"
+		return msg
+
+# execute an external command and return stdout
+def runproc(cmd):
+    #process = Popen(['pgrep', '-v', '-u', 'root', '-l'], stdout=PIPE, stderr=PIPE)
+    process = Popen(cmd.split(), stdout=PIPE, stderr=PIPE)
+    stdout, notused = process.communicate()
+    return stdout
+
+# the real meat
+# stealing this concept from logstash grok. We already know roughly what our process strings should look like so we can leverage that to polish output
+def procgrok(owner,short_cmd,long_cmd,exe,cwd):
+    # start with the short name
+    t = short_cmd
+    # some names we don't want to mess with
+    if t not in donottransform:
+        # if owner name is in the long command lets assume a match
+        if owner in re.findall(r'\w+', long_cmd):
+            t = owner
+        # if owner name is in the exe lets assume a match
+        if owner in re.findall(r'\w+', exe):
+            t = owner
+        # if owner name is in the path lets assume a match
+        if owner in re.findall(r'\w+', cwd):
+            t = owner
+        # foo java processes
+        r = re.search('foo/bar/baz', cwd)
+        if r != None:
+            t = 'foo'
+        # nrpe running under alternate user
+        if short_cmd == 'nrpe':
+            t = short_cmd
+        # if we've gotten this far and haven't IDed a java process, we should map it to unknown and fix that
+        if t == "java":
+            t = "unknown_java_proc"
+        # finally we map against the transform hash
+        if transform.has_key(t):
+            t = transform[t]
+    return t
+
+# grab all active listening tcp ports for later
+ltnp = runproc('ss -ltnp')
+
+# also grab a package list
+rpms = runproc('rpm -qa')
+
+data = AutoVivification()
+for line in runproc(pscom).splitlines():
+    pid, cmdline = line.split(' ', 1)
+    cmdpid = '%s\",%s' % (cmdline,pid)
+    ports = ""
+    # make sure we don't want to ignore the command
+    if cmdline not in exclude:
+	# match port numbers with pids
+        for n in ltnp.splitlines():
+            result = re.search(cmdpid, n)
+            if result != None:
+                ports += "'%s', " % (n.split()[2])
+	# find out where cwd is pointing under procfs
+        lscom = "ls -ald /proc/%s/cwd" % pid
+        fullcwd = runproc(lscom).split()
+        if len(fullcwd) == 0:
+		cwd = "ERROR: unable to obtain cwd"
+        else:
+            	cwd = fullcwd[len(fullcwd)-1].strip()
+	# find out where exe is pointing under procfs
+        lscom = "ls -ald /proc/%s/exe" % pid
+        fullexe = runproc(lscom).split()
+        if len(fullcwd) == 0:
+		exe = "ERROR: unable to obtain exe"	
+        else:
+            	exe = fullexe[len(fullexe)-1].strip()
+	# find out who owns task under procfs
+        fname = "/proc/%s/task" % pid
+        owner = find_owner(fname).strip()
+	# grab the value of cmdline from procfs
+        long_cmd = readfile(fname).strip()
+	# get the value of environ from procfs
+        fname = "/proc/%s/environ" % pid
+        environ = readfile(fname).strip()
+	# kinda cool but not necessary
+        #fname = "/proc/%s/limits" % pid
+        #limits = readfile(fname).strip()
+	# try to determine the best process name
+        procname = procgrok(owner,cmdline,long_cmd,exe,cwd)
+	# create a list of packages matching the procname and owner
+	tp = []
+	for a in [ procname, owner ]:
+		for pkg in rpms.splitlines():
+			result = re.search(a, pkg)
+			if result != None:
+				tp.append(pkg)
+	tp = uniqify(tp)
+	pkgs = ""
+	for pe in tp:
+		pkgs += "'%s', " % pe
+	# generate json entry
+	data[procname][hostname][pid]['date'] = ts
+	data[procname][hostname][pid]['owner'] = owner
+	data[procname][hostname][pid]['cwd'] = cwd
+	data[procname][hostname][pid]['exe'] = exe
+	data[procname][hostname][pid]['short_cmd'] = cmdline.strip()
+	data[procname][hostname][pid]['long_cmd'] = long_cmd
+	data[procname][hostname][pid]['environ'] = environ
+	#data[procname][hostname][pid]['limits'] = limits
+	data[procname][hostname][pid]['possible_packages'] = pkgs[:-2]
+	data[procname][hostname][pid]['tcp_ports'] = ports[:-2]
+print json.dumps(data)
